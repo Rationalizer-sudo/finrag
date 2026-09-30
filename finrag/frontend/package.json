@@ -1,0 +1,38 @@
+{
+  "name": "finrag-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FinRAG · 基于 RAG 的金融制度类知识问答系统前端（Vue 3 + Vite + Element Plus）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173",
+    "lint": "eslint . --ext .js,.vue",
+    "lint:fix": "eslint . --ext .js,.vue --fix"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.7.7",
+    "echarts": "^5.5.1",
+    "element-plus": "^2.7.8",
+    "marked": "^12.0.2",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.38",
+    "vue-router": "^4.3.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.2",
+    "eslint": "^8.57.0",
+    "eslint-plugin-vue": "^9.27.0",
+    "vite": "^5.4.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "browserslist": [
+    "> 1%",
+    "last 2 versions",
+    "not dead"
+  ]
+}

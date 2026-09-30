@@ -1,0 +1,43 @@
+# ============================================================================
+#  FinRAG 运行依赖
+#  Python >= 3.10 （Docker 镜像使用 python:3.11-slim）
+#  安装： pip install -r requirements.txt
+# ============================================================================
+
+# ---- Web 框架 / 接口层 -----------------------------------------------------
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3
+python-multipart>=0.0.9
+httpx>=0.27
+
+# ---- LangChain / 大模型（通义千问 OpenAI 兼容接入） -------------------------
+langchain>=1.0
+langchain-core>=1.0
+langchain-community>=0.4
+langchain-openai>=1.0
+langchain-text-splitters>=1.0
+openai>=1.40
+
+# ---- 数据库 / 存储 ---------------------------------------------------------
+SQLAlchemy>=2.0
+PyMySQL>=1.1
+cryptography>=42.0            # MySQL 8 caching_sha2_password 认证依赖
+pymilvus>=2.4
+
+# ---- 文档解析 / OCR --------------------------------------------------------
+pypdf>=4.2
+pdf2image>=1.17               # PDF -> 图片（需系统安装 poppler）
+pytesseract>=0.3.10           # OCR（需系统安装 tesseract-ocr + chi_sim 语言包）
+Pillow>=10.3
+python-docx>=1.1
+
+# ---- 检索增强 --------------------------------------------------------------
+rank-bm25>=0.2.2
+jieba>=0.42.1
+numpy>=1.26
+
+# ---- 配置 / 日志 -----------------------------------------------------------
+python-dotenv>=1.0
+# 日志使用标准库 logging，无额外依赖

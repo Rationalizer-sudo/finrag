@@ -1,0 +1,1391 @@
+{
+  "info": {
+    "name": "FinRAG · 金融制度智能问答系统 API",
+    "description": "基于 RAG 的金融制度类知识问答系统（FastAPI）接口调试集合。\n\n覆盖范围：系统自检、智能问答（含 SSE 流式）、知识库管理与入库、收藏管理。\n\n使用前请确认：\n1) 后端已启动（Docker: docker compose up -d，或本地: python backend/main.py）；\n2) 集合变量 baseUrl 指向真实服务地址（默认 http://127.0.0.1:8000/api/v1，经 Nginx 则改为 http://127.0.0.1/api/v1）；\n3) .env 中已配置有效的 DASHSCOPE_API_KEY，否则问答类接口会返回 502。\n\n推荐执行顺序（脚本会自动串联变量）：\n  健康检查 -> 文本入库(documentId) -> 条文列表(chunkId) -> 提问(historyId) -> 新增收藏(favoriteId) -> 收藏列表\n\n统一响应体约定：成功 {\"code\":0,\"message\":\"ok\",\"data\":{...}}；失败 {\"code\":非0,...,\"detail\":...,\"request_id\":\"...\"}。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000/api/v1",
+      "type": "string",
+      "description": "接口根地址（FastAPI 的 API_PREFIX）。直连后端为 http://127.0.0.1:8000/api/v1；经 Nginx 反向代理为 http://127.0.0.1/api/v1。"
+    },
+    {
+      "key": "userId",
+      "value": "demo-user",
+      "type": "string",
+      "description": "用户标识，用于问答历史与收藏的数据隔离。后端 user_id 查询参数默认 anonymous。"
+    },
+    {
+      "key": "sessionId",
+      "value": "demo-session-001",
+      "type": "string",
+      "description": "会话标识，便于把同一轮多问归入同一会话。"
+    },
+    {
+      "key": "documentId",
+      "value": "",
+      "type": "string",
+      "description": "制度文档主键 ID。由「文本入库」/「文档列表」的测试脚本自动写入。"
+    },
+    {
+      "key": "chunkId",
+      "value": "",
+      "type": "string",
+      "description": "条文（知识点）主键 ID。由「条文列表」/「提问」的测试脚本自动写入。"
+    },
+    {
+      "key": "historyId",
+      "value": "",
+      "type": "string",
+      "description": "问答历史主键 ID。由「提问」/「问答历史列表」的测试脚本自动写入。"
+    },
+    {
+      "key": "favoriteId",
+      "value": "",
+      "type": "string",
+      "description": "收藏主键 ID。由「新增收藏」/「收藏列表」的测试脚本自动写入。"
+    },
+    {
+      "key": "minioBucketName",
+      "value": "a-bucket",
+      "type": "string",
+      "description": "Milvus 使用的 MinIO 桶名（仅部署参考，接口调试用不到）。"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. 系统",
+      "description": "系统级接口：依赖连通性、存活探针、能力清单。建议作为每次调试的第一组请求执行。",
+      "item": [
+        {
+          "name": "健康检查",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health",
+            "description": "用途：返回 MySQL / Milvus / 通义千问对话 / 通义千问向量化 / Tesseract OCR 五个组件的连通状态。\n\n参数：无。\n\n预期响应：\n  status = ok（全部健康）/ degraded（MySQL 通但其他组件异常）/ down（MySQL 不通）；\n  components[].healthy 逐项布尔值，detail 内含连接串、版本、错误原因等排障信息。\n\n注意：本接口会真实连接各依赖，耗时可能达数百毫秒；容器存活探针请改用 /health/live。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// 断言：HTTP 200，且响应体含组件清单",
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"响应体包含 status 与 components\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property(\"status\");",
+                  "    pm.expect(body).to.have.property(\"components\");",
+                  "    pm.expect(body.components).to.be.an(\"array\");",
+                  "});",
+                  "",
+                  "pm.test(\"MySQL 为硬依赖，必须连通（否则 status=down）\", function () {",
+                  "    const body = pm.response.json();",
+                  "    const mysql = (body.components || []).find(function (c) { return c.name === \"mysql\"; });",
+                  "    if (mysql) {",
+                  "        pm.expect(mysql.healthy, \"MySQL 未连通：检查 .env 的 MYSQL_* 配置与 mysql 容器状态\").to.be.true;",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "存活探针",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/health/live",
+            "description": "用途：不访问任何外部依赖的存活探针，供容器编排（HEALTHCHECK / K8s livenessProbe）使用。\n\n参数：无。\n\n预期响应：{\"status\":\"alive\",\"uptime_seconds\":12.3}。\n\n若本接口不通说明进程已死，而 /health 返回 degraded 只说明依赖异常——两者含义不同，不要混用。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"status 为 alive\", function () {",
+                  "    pm.expect(pm.response.json().status).to.eql(\"alive\");",
+                  "});",
+                  "",
+                  "pm.test(\"响应耗时低于 500ms（纯内存操作）\", function () {",
+                  "    pm.expect(pm.response.responseTime).to.be.below(500);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "能力清单",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/capabilities",
+            "description": "用途：汇总系统支持的文件类型、检索模式、时效状态枚举、默认参数、课题指标与可选依赖安装情况。\n\n参数：无。\n\n预期响应关键字段：\n  supported_extensions  允许上传的扩展名；\n  retrieval_modes       vector / bm25 / hybrid；\n  doc_statuses          现行有效 / 尚未生效 / 已修订 / 已废止 / 状态待核；\n  valid_doc_statuses    被视为「有效」的状态集合（检索默认只返回这些）；\n  features              功能开关（file_upload / ocr / pdf / docx / vector_store ...）；\n  dependencies.missing  缺失的可选依赖及补装提示。\n\n前端可据此自适应隐藏不可用入口。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"包含检索模式与功能开关\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.retrieval_modes).to.be.an(\"array\");",
+                  "    pm.expect(body.retrieval_modes).to.include(\"hybrid\");",
+                  "    pm.expect(body).to.have.property(\"features\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. 问答",
+      "description": "智能问答主链路：RAG 检索 + 通义千问生成 + 条文溯源 + 可信度评分；以及问答历史的查询与清理。",
+      "item": [
+        {
+          "name": "提问",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/qa/ask",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"question\": \"商业银行流动性风险管理的报送频率要求是什么\",\n  \"top_k\": 5,\n  \"retrieval_mode\": \"hybrid\",\n  \"only_valid\": true,\n  \"exclude_expired\": true,\n  \"statuses\": [],\n  \"business_lines\": [\"银行\"],\n  \"doc_types\": [],\n  \"document_ids\": [],\n  \"as_of\": null,\n  \"user_id\": \"{{userId}}\",\n  \"session_id\": \"{{sessionId}}\",\n  \"save_history\": true,\n  \"include_all_citations\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：基于知识库检索制度条文并生成回答，返回条文溯源与 0~100 可信度评分。\n\n参数说明（JSON body）：\n  question              必填，用户问题，长度 1~500。\n  top_k                 返回证据条数，1~20，默认 5。\n  retrieval_mode        vector（纯语义）/ bm25（纯关键词）/ hybrid（混合 + RRF 融合），默认 hybrid。\n  only_valid            是否仅检索现行有效条文，默认 true。\n  exclude_expired       是否过滤已过时条文，默认 true。\n  statuses[]            按时效状态过滤，取值见 /capabilities 的 doc_statuses。\n  business_lines[]      按业务条线过滤（银行/证券/保险/基金/支付结算/反洗钱/信托/期货/综合）。\n  doc_types[]           按文件类型过滤（法律/行政法规/部门规章/规范性文件/自律规则/国家标准/其他）。\n  document_ids[]        限定检索的文档范围。\n  as_of                 以指定日期（YYYY-MM-DD）判断条文时效性。\n  user_id               用户标识，默认 anonymous，与历史/收藏数据归属一致。\n  session_id            会话标识，便于按会话聚合历史。\n  save_history          是否落库问答历史，默认 true；置 false 可做压测而不污染数据。\n  include_all_citations 是否把未被回答引用的召回条文一并返回。\n\n预期响应 data 字段：\n  answer        回答正文，含 [1][2] 形式的引用角标；\n  has_answer    是否真正基于知识库条文作答（无证据时为 false 并给出兜底话术）；\n  citations[]   溯源列表：index/chunk_id/document_id/doc_title/doc_no/clause_no/content/score 等；\n  credibility   {score: 0~100, label: 高/中/低/不可信, components, reasons}；\n  latency_ms    端到端耗时；within_budget 是否满足 ≤2s 的响应目标；\n  history_id    本次问答的历史记录 ID（本请求脚本会自动写入集合变量 historyId）。\n\n常见错误：502 表示未配置 DASHSCOPE_API_KEY 或大模型调用失败；422 为参数校验失败（detail 内有字段级明细）。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// ===== 响应结构与业务断言 =====",
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test(\"业务码 code === 0\", function () {",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "});",
+                  "",
+                  "pm.test(\"data.answer 为非空字符串\", function () {",
+                  "    pm.expect(body.data).to.be.an(\"object\");",
+                  "    pm.expect(body.data.answer).to.be.a(\"string\");",
+                  "    pm.expect(body.data.answer.trim().length).to.be.above(0);",
+                  "});",
+                  "",
+                  "pm.test(\"data.citations 是数组\", function () {",
+                  "    pm.expect(body.data.citations).to.be.an(\"array\");",
+                  "});",
+                  "",
+                  "pm.test(\"可信度评分在 0~100 区间\", function () {",
+                  "    const c = body.data.credibility;",
+                  "    pm.expect(c).to.be.an(\"object\");",
+                  "    pm.expect(c.score).to.be.within(0, 100);",
+                  "});",
+                  "",
+                  "// ===== 把 history_id 写入集合变量，供「历史详情 / 删除历史 / 新增收藏」复用 =====",
+                  "if (body.data && body.data.history_id) {",
+                  "    pm.collectionVariables.set(\"historyId\", String(body.data.history_id));",
+                  "    console.log(\"已记录 historyId = \" + body.data.history_id);",
+                  "} else {",
+                  "    console.warn(\"响应中无 history_id：可能是 save_history=false，或该轮未落库。\");",
+                  "}",
+                  "",
+                  "// 顺带记录首条引用，方便手动去「条文详情」验证溯源落地页",
+                  "if (body.data && Array.isArray(body.data.citations) && body.data.citations.length > 0) {",
+                  "    pm.collectionVariables.set(\"chunkId\", String(body.data.citations[0].chunk_id));",
+                  "    pm.collectionVariables.set(\"documentId\", String(body.data.citations[0].document_id));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "流式问答（SSE）",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Cache-Control",
+                "value": "no-cache"
+              }
+            ],
+            "url": "{{baseUrl}}/qa/ask/stream",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"question\": \"商业银行流动性风险管理的报送频率要求是什么\",\n  \"top_k\": 5,\n  \"retrieval_mode\": \"hybrid\",\n  \"only_valid\": true,\n  \"user_id\": \"{{userId}}\",\n  \"session_id\": \"{{sessionId}}\",\n  \"save_history\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：以 Server-Sent Events 流式返回回答，前端可实现「打字机」逐字渲染，首字节延迟远低于非流式接口。\n\n参数：与非流式「提问」完全一致（同一套 AskRequest 模型）。\n\n事件序列（响应 Content-Type: text/event-stream）：\n  1) event: meta  —— data 为 {\"evidence_count\":n,\"citations\":[...]}，先于正文下发，便于前端立即渲染依据面板；\n  2) event: delta —— data 为 {\"text\":\"增量片段\"}，可多次；\n  3) event: done  —— data 为 {\"credibility\":{...},\"cited_indexes\":[...]}；无证据时仅含 {\"finished\":true}；\n  4) event: error —— 大模型调用异常时下发 {\"message\":\"...\"}。\n\n调试提示：Postman 会等整个响应结束后才在 Body 中显示完整事件流，因此看不到逐字效果属正常，可复制为 cURL 在终端观察（curl -N ...）。\n\n经 Nginx 部署时必须确认该路径已关闭 proxy_buffering（见 nginx/default.conf），否则事件会被攒住整段返回。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"Content-Type 为 text/event-stream\", function () {",
+                  "    pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/event-stream\");",
+                  "});",
+                  "",
+                  "pm.test(\"事件流包含 meta / delta 事件\", function () {",
+                  "    const text = pm.response.text();",
+                  "    pm.expect(text).to.include(\"event: meta\");",
+                  "    pm.expect(text).to.include(\"event: delta\");",
+                  "});",
+                  "",
+                  "pm.test(\"事件流以 done 事件收尾\", function () {",
+                  "    pm.expect(pm.response.text()).to.include(\"event: done\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "问答历史列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/qa/history?user_id={{userId}}&limit=20&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "qa",
+                "history"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，与提问时保持一致"
+                },
+                {
+                  "key": "keyword",
+                  "value": "",
+                  "description": "可选，按问题/回答内容模糊搜索",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "每页条数 1~100"
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "偏移量，从 0 开始"
+                }
+              ]
+            },
+            "description": "用途：分页查询当前用户的问答历史。\n\n参数（query）：\n  user_id  用户标识，默认 anonymous，需与提问时的 user_id 一致；\n  keyword  按问题/回答内容模糊搜索，最长 100；\n  limit    每页条数 1~100，默认 20；\n  offset   偏移量，从 0 开始。\n\n预期响应 data：{items:[{id, question, answer, retrieval_mode, evidence_count, latency_ms, credibility_score, credibility_label, citations, favorited, created_at}], meta:{total, limit, offset, has_more}}。\n\n提示：若查询结果为空，先确认提问时 save_history 是否为 true。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"业务码 code === 0 且返回分页结构\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.items).to.be.an(\"array\");",
+                  "    pm.expect(body.data.meta).to.have.property(\"total\");",
+                  "});",
+                  "",
+                  "// 有历史记录时自动带上第一条 id，便于后续「历史详情 / 删除历史」直接执行",
+                  "const items = (pm.response.json().data || {}).items || [];",
+                  "if (items.length > 0) {",
+                  "    pm.collectionVariables.set(\"historyId\", String(items[0].id));",
+                  "} else {",
+                  "    console.log(\"历史为空：请先执行「提问」并确保 save_history=true。\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "历史详情",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/qa/history/{{historyId}}?user_id={{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "qa",
+                "history",
+                "{{historyId}}"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，需与记录归属一致"
+                }
+              ]
+            },
+            "description": "用途：按主键获取单条问答历史，含完整回答与全部引用条文。\n\n参数：\n  history_id  路径参数，来自「提问」响应 data.history_id（脚本已自动写入 {{historyId}}）；\n  user_id     查询参数，默认 anonymous，必须与记录归属一致，否则返回 404。\n\n预期响应 data：HistoryItem（含 citations 完整数组、credibility_score、latency_ms 等）。\n\n前置条件：需先执行一次「提问」或「问答历史列表」以填充 {{historyId}}。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回问题文本与引用数组\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.question).to.be.a(\"string\");",
+                  "    pm.expect(body.data.citations).to.be.an(\"array\");",
+                  "});",
+                  "",
+                  "// 历史里若带引用，顺手补齐 chunkId / documentId",
+                  "const data = pm.response.json().data || {};",
+                  "if (Array.isArray(data.citations) && data.citations.length > 0) {",
+                  "    const first = data.citations[0];",
+                  "    if (first.chunk_id) { pm.collectionVariables.set(\"chunkId\", String(first.chunk_id)); }",
+                  "    if (first.document_id) { pm.collectionVariables.set(\"documentId\", String(first.document_id)); }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "删除历史",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/qa/history/{{historyId}}?user_id={{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "qa",
+                "history",
+                "{{historyId}}"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，需与记录归属一致"
+                }
+              ]
+            },
+            "description": "用途：删除一条问答历史记录。\n\n参数：\n  history_id  路径参数，{{historyId}}；\n  user_id     查询参数，默认 anonymous，需与记录归属一致。\n\n预期响应 data：{\"deleted\":true,\"history_id\":N}。\n\n注意：删除历史不会级联删除已产生的收藏记录（收藏保存了问题与回答快照），这一点便于收藏长期留存。\n\n副作用提示：本请求会真实删除数据，调试时请确认 {{historyId}} 指向可删除的测试记录。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回 deleted=true\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.deleted).to.be.true;",
+                  "});",
+                  "",
+                  "// 删除后清空变量，避免后续请求误用已失效的 id",
+                  "pm.collectionVariables.set(\"historyId\", \"\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "清空历史",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/qa/history?user_id={{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "qa",
+                "history"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，将清空该用户全部历史"
+                }
+              ]
+            },
+            "description": "用途：清空当前用户的全部问答历史。\n\n参数：\n  user_id  查询参数，默认 anonymous。\n\n预期响应 data：{\"deleted_count\":N}，N 为实际删除条数。\n\n【高危】不可恢复，且会一并清掉答辩演示积累的历史数据。调试前请先确认 user_id 指向测试账号（默认 demo-user）。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回 deleted_count 且为数字\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.deleted_count).to.be.a(\"number\");",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set(\"historyId\", \"\");"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. 知识库",
+      "description": "知识库全生命周期管理：总览统计、文本/文件入库、向量重建、文档与条文检索、标签、入库任务审计、OCR 状态。\n\n写入类接口（入库、重建向量、修订、删除）会真实改动 MySQL 与 Milvus 数据，请只在测试库执行。",
+      "item": [
+        {
+          "name": "知识库总览统计",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/stats",
+            "description": "用途：返回知识库规模与各组件达标情况，适合作为演示首屏数据。\n\n参数：无。\n\n预期响应 data 关键字段：\n  document_count / chunk_count / tag_count / ocr_document_count  各类计数；\n  status_counts / business_line_counts                           按时效状态、业务条线的分布；\n  vector_count / vector_ready                                    Milvus 中向量数与可用性；\n  ocr_status / llm_status / embedding_status                     各组件就绪状态；\n  meets_target                                                   是否满足课题指标（如 1000+ 知识点）；\n  latest_updated_at                                              最近一次入库时间。\n\n排障：vector_count 为 0 而 chunk_count 大于 0，说明条文已入 MySQL 但向量未写入，请执行「重建向量」接口。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回文档数与条文数\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.document_count).to.be.a(\"number\");",
+                  "    pm.expect(body.data.chunk_count).to.be.a(\"number\");",
+                  "});",
+                  "",
+                  "pm.test(\"包含向量库就绪标记\", function () {",
+                  "    pm.expect(pm.response.json().data).to.have.property(\"vector_ready\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "文本入库",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/knowledge/documents/text",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"商业银行流动性风险管理办法（示例）\\n\\n第一条 为加强商业银行流动性风险管理，维护银行体系安全稳健运行，根据《中华人民共和国银行业监督管理法》等法律法规，制定本办法。\\n\\n第二条 本办法所称流动性风险，是指商业银行无法以合理成本及时获得充足资金，用于偿付到期债务、履行其他支付义务和满足正常业务开展的资金需求的风险。商业银行应当建立与自身业务规模、复杂程度和风险状况相适应的流动性风险管理体系，包括治理架构、管理策略、风险识别与计量、监测与报告等要素。\\n\\n第三条 商业银行应当持续监测流动性风险水平及其变化趋势，按日监测流动性覆盖率与净稳定资金比例等监管指标。流动性风险管理报告应当按月编制并报送董事会或者其授权的专门委员会，其中流动性风险监管指标报表应当于每月结束后十个工作日内报送银行业监督管理机构；发生流动性风险突发事件时，应当在事件发生后二十四小时内向银行业监督管理机构报告。\\n\\n第四条 本办法自发布之日起施行。商业银行应当自本办法施行之日起六个月内完成流动性风险管理体系的整改完善工作。\",\n  \"file_name\": \"商业银行流动性风险管理办法_示例.txt\",\n  \"source_url\": \"https://www.example.gov.cn/regulation/liquidity-risk-demo\",\n  \"doc_type\": \"\",\n  \"business_line\": \"\",\n  \"status\": \"\",\n  \"replace\": true,\n  \"force\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：粘贴制度全文入库，自动完成清洗 -> 元数据抽取 -> 条文切分 -> MySQL 落库 -> 向量化写入 Milvus。这是无需上传文件即可灌数据的主要入口，适合批量导入与演示准备。\n\n参数说明（JSON body）：\n  text          必填，制度全文，最少 10 字符；\n  file_name     逻辑文件名，默认 inline.txt。同一 file_name 会命中「覆盖旧版本」逻辑；\n  source_url    公开来源链接（便于条文溯源跳转）；\n  doc_type      留空则按关键词自动推断（见 /capabilities 的 doc_types）；\n  business_line 留空则自动推断（示例文本含「商业银行」「流动性」会被判为「银行」）；\n  status        留空则自动推断时效状态；\n  replace       同一文件是否覆盖旧版本，默认 true；\n  force         内容未变（file_hash 相同）时是否强制重新入库，默认 false，会返回 skipped。\n\n预期响应 data：IngestResultOut —— document_id、task_id、title、doc_no、issuer、doc_type、business_line、doc_status、chunk_count、vector_count、ocr_used、parser_name、file_hash、cost_ms、warnings[]。\n\n本请求脚本会把 data.document_id 写入集合变量 documentId，供后续文档详情/修订/删除复用。\n\n注意：入库会调用通义千问 embedding 接口，需保证 DASHSCOPE_API_KEY 有效且余额充足；示例文本刻意写成「第一条/第二条/第三条」，便于验证条文切分是否正确识别条款号。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test(\"业务码 code === 0\", function () {",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "});",
+                  "",
+                  "pm.test(\"切分出至少 1 条条文\", function () {",
+                  "    pm.expect(body.data).to.be.an(\"object\");",
+                  "    pm.expect(body.data.chunk_count).to.be.above(0);",
+                  "});",
+                  "",
+                  "// 把入库产生的 document_id 写入集合变量，供文档详情/修订/删除复用",
+                  "if (body.data && body.data.document_id) {",
+                  "    pm.collectionVariables.set(\"documentId\", String(body.data.document_id));",
+                  "    console.log(\"已记录 documentId = \" + body.data.document_id);",
+                  "} else {",
+                  "    console.warn(\"未返回 document_id：可能是内容未变被 skipped（force=false），或入库失败。message=\" + (body.message || \"\"));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "上传文件",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/documents/upload",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "<文件路径>",
+                  "description": "必填：制度文件。请在 Postman 中选择本地文件替换 <文件路径> 占位。"
+                },
+                {
+                  "key": "source_url",
+                  "value": "https://www.example.gov.cn/regulation/upload-demo",
+                  "type": "text",
+                  "description": "可选：公开来源链接，用于条文溯源跳转"
+                },
+                {
+                  "key": "replace",
+                  "value": "true",
+                  "type": "text",
+                  "description": "同文件是否覆盖旧版本，默认 true"
+                },
+                {
+                  "key": "force",
+                  "value": "false",
+                  "type": "text",
+                  "description": "内容未变（file_hash 相同）时是否强制重新入库"
+                },
+                {
+                  "key": "keep_file",
+                  "value": "true",
+                  "type": "text",
+                  "description": "入库后是否保留上传文件"
+                }
+              ]
+            },
+            "description": "用途：上传制度文件入库（txt / md / pdf / docx / png / jpg / jpeg / bmp / tif / tiff）。图片与扫描版 PDF 会走 Tesseract OCR 识别（chi_sim+eng）。\n\n请求体：multipart/form-data\n  file        必填，File 类型。在 Postman 的 Body -> form-data 中将该行类型由 Text 改为 File，然后选择本地文件（原占位值为 <文件路径>）；\n  source_url  可选，公开来源链接；\n  replace     同文件是否覆盖旧版本，默认 true；\n  force       内容未变是否强制入库，默认 false；\n  keep_file   入库后是否保留上传文件到 UPLOAD_DIR，默认 true。\n\n处理链路：上传落盘 -> 白名单与体积校验 -> 解析（图片/扫描 PDF 走 OCR）-> 清洗 -> 元数据抽取 -> 条文切分 -> MySQL -> 向量化写 Milvus。\n\n预期响应 data：IngestResultOut，其中 ocr_used 标记是否走了 OCR，parser_name 为实际使用的解析器。\n\n常见错误：\n  50010 说明服务端缺少 python-multipart，执行 pip install python-multipart 后重启；\n  413 / 400 为超出 MAX_UPLOAD_MB（默认 50MB）或扩展名不在白名单（先用「上传限制」接口确认）；\n  OCR 相关失败请先用「OCR 状态」接口确认 tesseract 是否可用。\n\n合规提醒：仅允许上传公开制度数据，禁止上传涉密或企业敏感材料。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "if (body.code !== 0) {",
+                  "    // 未选文件时后端返回 422；缺少 python-multipart 时返回 50010（此时已注册兜底提示接口）",
+                  "    console.warn(\"上传未成功，code=\" + body.code + \" message=\" + body.message);",
+                  "}",
+                  "",
+                  "pm.test(\"响应为统一结构（含 code 字段）\", function () {",
+                  "    pm.expect(body).to.have.property(\"code\");",
+                  "});",
+                  "",
+                  "if (body.code === 0 && body.data && body.data.document_id) {",
+                  "    pm.collectionVariables.set(\"documentId\", String(body.data.document_id));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "上传限制",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/documents/upload/limits",
+            "description": "用途：返回允许上传的扩展名与单文件大小上限，供前端做前置校验（避免用户传完才被拒）。\n\n参数：无。\n\n预期响应 data：{\"allowed_extensions\":[\".bmp\",\".docx\",\".jpeg\",\".jpg\",\".md\",\".pdf\",\".png\",\".tif\",\".tiff\",\".txt\"],\"max_upload_mb\":50}。\n\n对应后端配置项：ALLOWED_EXTENSIONS 与 MAX_UPLOAD_MB。\n注意：经 Nginx 部署时 client_max_body_size（默认 60m）应大于 max_upload_mb，否则会先被网关以 413 拒绝。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回扩展名白名单与大小上限\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.data.allowed_extensions).to.be.an(\"array\");",
+                  "    pm.expect(body.data.max_upload_mb).to.be.a(\"number\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "重建向量",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/knowledge/vectors/rebuild",
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：按 MySQL 现有条文重新生成 embedding 并写入 Milvus 集合。\n\n参数：无（body 为空对象）。\n\n预期响应 data：含重建条数与写入向量数等统计，message 为「向量索引重建完成」。\n\n适用场景：Milvus 集合被误删、向量写入曾失败、更换 embedding 模型或调整向量维度后。\n\n代价提示：会对全库条文重新调用通义千问 embedding 接口，条文量上千时耗时较长（可能数分钟）且消耗额度，请勿在高频调试中反复执行。若条文量大，建议在后端容器内用 scripts 下的 CLI 分批执行。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"业务码 code === 0\", function () {",
+                  "    pm.expect(pm.response.json().code).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "文档列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/knowledge/documents?limit=20&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "knowledge",
+                "documents"
+              ],
+              "query": [
+                {
+                  "key": "keyword",
+                  "value": "",
+                  "description": "可选：按名称/文号/发文机关搜索",
+                  "disabled": true
+                },
+                {
+                  "key": "status",
+                  "value": "现行有效",
+                  "description": "可选：时效状态过滤",
+                  "disabled": true
+                },
+                {
+                  "key": "business_line",
+                  "value": "银行",
+                  "description": "可选：业务条线过滤",
+                  "disabled": true
+                },
+                {
+                  "key": "doc_type",
+                  "value": "规范性文件",
+                  "description": "可选：文件类型过滤",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "每页条数 1~200"
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "偏移量，从 0 开始"
+                }
+              ]
+            },
+            "description": "用途：分页查询知识库中的制度文档。\n\n参数（query）：\n  keyword        按名称 / 文号 / 发文机关模糊搜索，最长 100；\n  status         按时效状态过滤（现行有效 / 尚未生效 / 已修订 / 已废止 / 状态待核）；\n  business_line  按业务条线过滤（银行 / 证券 / 保险 / 基金 / 支付结算 / 反洗钱 / 信托 / 期货 / 综合）；\n  doc_type       按文件类型过滤（法律 / 行政法规 / 司法解释 / 部门规章 / 规范性文件 / 自律规则 / 国家标准 / 其他）；\n  limit          每页条数 1~200，默认 20；\n  offset         偏移量，从 0 开始。\n\n预期响应 data：{items:[DocumentOut], meta:{total, limit, offset, has_more}}。DocumentOut 含 id、doc_no、title、issuer、doc_type、business_line、status、publish_date、effective_date、expiry_date、source_url、file_name、file_type、ocr_used、chunk_count、version、remark、tags[]、created_at、updated_at。\n\n本请求脚本会把 items[0].id 写入集合变量 documentId，便于后续「文档详情 / 修订 / 删除」直接执行。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回分页结构与文档数组\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.items).to.be.an(\"array\");",
+                  "    pm.expect(body.data.meta).to.have.property(\"total\");",
+                  "});",
+                  "",
+                  "// 把第一个文档的 id 写入集合变量 documentId",
+                  "const items = (pm.response.json().data || {}).items || [];",
+                  "if (items.length > 0) {",
+                  "    pm.collectionVariables.set(\"documentId\", String(items[0].id));",
+                  "    console.log(\"已记录 documentId = \" + items[0].id);",
+                  "} else {",
+                  "    console.warn(\"文档列表为空：请先执行「文本入库」或「上传文件」。\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "文档详情",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/documents/{{documentId}}",
+            "description": "用途：按主键获取单个制度文档详情（含标签与条文计数）。\n\n参数：\n  document_id  路径参数，{{documentId}}（由「文本入库」或「文档列表」脚本自动写入）。\n\n预期响应 data：DocumentOut，字段含义同「文档列表」条目。\n\n排障：返回 404 且 message 为「资源不存在」时，多为 {{documentId}} 为空或已被删除；请先执行「文本入库」或「文档列表」。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回文档标题与版本号\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.title).to.be.a(\"string\");",
+                  "    pm.expect(body.data).to.have.property(\"version\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "修订文档元数据",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/knowledge/documents/{{documentId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"doc_no\": \"银保监发〔2024〕1号\",\n  \"issuer\": \"国家金融监督管理总局\",\n  \"doc_type\": \"规范性文件\",\n  \"business_line\": \"银行\",\n  \"status\": \"现行有效\",\n  \"effective_date\": \"2024-01-01\",\n  \"expiry_date\": null,\n  \"remark\": \"人工复核确认：现行有效，报送频率以第三条为准\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：人工修订文档元数据，典型场景是人工确认时效状态（自动抽取可能有误）或补录文号、发文机关。\n\n参数（JSON body，字段全部可选，只传需要改的）：\n  title / doc_no / issuer / doc_type / business_line / status\n  publish_date / effective_date / expiry_date   日期字符串（YYYY-MM-DD）\n  source_url / remark\n  status 取值：现行有效 / 尚未生效 / 已修订 / 已废止 / 状态待核。\n\n预期响应 data：修订后的完整 DocumentOut。\n\n重要机制：修改时效字段（status / effective_date / expiry_date）时会同步更新条文表与 Milvus 中的过滤字段，使下一次检索立即按新状态过滤，无需重建向量——这正是「时效性管理」的关键设计。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"修订字段已生效\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.status).to.eql(\"现行有效\");",
+                  "    pm.expect(body.data.issuer).to.be.a(\"string\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "删除文档",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/documents/{{documentId}}",
+            "description": "用途：删除制度文档，同时清理其下全部条文（MySQL）与对应向量（Milvus），保证两个存储不出现孤儿数据。\n\n参数：\n  document_id  路径参数，{{documentId}}。\n\n预期响应 data：含删除结果统计（如 deleted_chunks、deleted_vectors、document_id 等）。\n\n【高危】不可恢复。删除后引用该文档的问答历史中 citations 仍保留快照文本，但「条文详情」溯源页将返回 404。调试时请先确认 {{documentId}} 指向测试文档。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"业务码 code === 0\", function () {",
+                  "    pm.expect(pm.response.json().code).to.eql(0);",
+                  "});",
+                  "",
+                  "// 文档已删除，清空相关变量避免后续请求 404",
+                  "pm.collectionVariables.set(\"documentId\", \"\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "条文列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/knowledge/chunks?limit=20&offset=0&only_valid=false",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "knowledge",
+                "chunks"
+              ],
+              "query": [
+                {
+                  "key": "document_id",
+                  "value": "{{documentId}}",
+                  "description": "可选：限定文档，留空则查全库",
+                  "disabled": true
+                },
+                {
+                  "key": "keyword",
+                  "value": "流动性",
+                  "description": "可选：按条文正文搜索",
+                  "disabled": true
+                },
+                {
+                  "key": "only_valid",
+                  "value": "false",
+                  "description": "是否仅返回现行有效条文"
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "每页条数 1~200"
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "偏移量"
+                }
+              ]
+            },
+            "description": "用途：分页查询知识点（条文级片段），用于核对切分质量与检索过滤字段。\n\n参数（query）：\n  document_id    限定某个文档的条文，默认不限；\n  keyword        按条文正文模糊搜索，最长 100；\n  only_valid     是否仅返回现行有效条文，默认 false（管理视角看全量）；\n  business_line  按业务条线过滤；\n  limit          每页条数 1~200，默认 20；\n  offset         偏移量。\n\n预期响应 data：{items:[ChunkOut], meta:{...}}。ChunkOut 含 id、document_id、chunk_index、clause_no（条款号，如「第三条」）、chapter、article_title、content、char_count、token_count、status、effective_date、expiry_date、business_line、doc_type、milvus_pk、tags[]、doc_title、doc_no、source_url。\n\n本请求脚本会把 items[0].id 写入集合变量 chunkId，供「条文详情」直接执行。\n\n观察要点：clause_no 是否正确识别出「第一条/第二条/第三条」；milvus_pk 非空说明该条文已成功写入向量库。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回条文数组与分页元信息\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.items).to.be.an(\"array\");",
+                  "    pm.expect(body.data.meta).to.have.property(\"total\");",
+                  "});",
+                  "",
+                  "// 把第一条条文 id 写入集合变量 chunkId",
+                  "const items = (pm.response.json().data || {}).items || [];",
+                  "if (items.length > 0) {",
+                  "    pm.collectionVariables.set(\"chunkId\", String(items[0].id));",
+                  "    console.log(\"已记录 chunkId = \" + items[0].id);",
+                  "} else {",
+                  "    console.warn(\"条文列表为空：知识库尚未入库数据。\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "条文详情",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/chunks/{{chunkId}}",
+            "description": "用途：按主键获取条文正文，也就是问答回答中引用角标 [1] 点击后的「溯源落地页」数据源。\n\n参数：\n  chunk_id  路径参数，{{chunkId}}（由「条文列表」或「提问」脚本写入）。\n\n预期响应 data：ChunkOut，含 clause_no、chapter、content、status、doc_title、doc_no、source_url 等，前端据此渲染「出处定位」卡片。\n\n这是「答案可溯源」这一核心要求的落地验证点：从提问返回的 citations[].chunk_id 调本接口，应能拿到与引用完全一致的条文正文。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回条文正文与所属文档信息\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.content).to.be.a(\"string\");",
+                  "    pm.expect(body.data.content.length).to.be.above(0);",
+                  "    pm.expect(body.data).to.have.property(\"doc_title\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "标签列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/knowledge/tags?limit=100",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "knowledge",
+                "tags"
+              ],
+              "query": [
+                {
+                  "key": "category",
+                  "value": "主题",
+                  "description": "可选：按标签分类过滤",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "100",
+                  "description": "返回条数 1~500"
+                }
+              ]
+            },
+            "description": "用途：列出知识点标签，支撑标签分类管理与按主题浏览。\n\n参数（query）：\n  category  按标签分类过滤（如「主题」「业务条线」「文件类型」等，取决于入库时的打标策略），最长 32；\n  limit     返回条数上限 1~500，默认 100。\n\n预期响应 data：TagOut 数组 —— [{id, name, category, description, ref_count}]，ref_count 为该标签被引用的条文数。\n\n注意：本接口返回数组而非分页对象（data 直接是 list），与文档/条文列表不同。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"data 为标签数组\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data).to.be.an(\"array\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "入库任务列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/knowledge/tasks?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "knowledge",
+                "tasks"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "返回条数 1~200"
+                }
+              ]
+            },
+            "description": "用途：列出最近的入库任务，用于「知识库增量更新」的审计与问题定位（哪次入库失败、卡在哪个阶段、是否走了 OCR、耗时多少）。\n\n参数（query）：\n  limit  返回条数 1~200，默认 20。\n\n预期响应 data：IngestTaskOut 数组 —— [{id, task_no, file_name, document_id, status, stage, total_chunks, processed_chunks, ocr_used, cost_ms, message, created_at}]。\n\nstatus 取值：pending / running / success / partial / failed / skipped。\n  partial 表示部分条文入库成功（如个别 embedding 调用失败），需结合 message 与 warnings 判断；\n  skipped 通常因内容未变且 force=false。\n\n注意：data 直接是数组，非分页对象。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"data 为任务数组\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data).to.be.an(\"array\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "OCR 状态",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/knowledge/ocr/status",
+            "description": "用途：查询 Tesseract OCR 是否就绪，用于判断图片 / 扫描版 PDF 能否入库。\n\n参数：无。\n\n预期响应 data：OcrEngine.status() —— 通常含 available（是否可用）、enabled（配置开关）、languages（已安装语言包，应为 chi_sim+eng）、tesseract_version、cmd（可执行文件路径）、error/detail（不可用原因）。\n\n排障：\n  本地开发需安装 Tesseract 并配置 TESSERACT_CMD（如 C:\\\\Program Files\\\\Tesseract-OCR\\\\tesseract.exe）；\n  Docker 镜像已内置 tesseract-ocr + tesseract-ocr-chi-sim，无需配置 TESSERACT_CMD；\n  若 available=false 且 enabled=true，多为语言包缺失或路径错误。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回 OCR 可用性标记\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data).to.have.property(\"available\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. 收藏",
+      "description": "问答结果收藏管理：收藏某次问答、分页查询、修改备注、取消收藏。收藏保存问题与回答快照，因此删除历史后收藏依然可读。",
+      "item": [
+        {
+          "name": "新增收藏",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/favorites",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"history_id\": {{historyId}},\n  \"question\": \"商业银行流动性风险管理的报送频率要求是什么\",\n  \"answer\": \"\",\n  \"note\": \"答辩演示重点：流动性风险指标按月报送，重大事件 24 小时内报告\",\n  \"user_id\": \"{{userId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：收藏一条问答结果，便于后续复习或作为制度依据留存。\n\n参数（JSON body）：\n  history_id  可选，来源问答历史 ID。传该字段时后端会自动带出该次问答的问题、回答与引用，无需重复传 question/answer；重复收藏同一 history_id 会幂等返回已有收藏（不会产生重复记录）；\n  question    可选，问题文本（不传 history_id 时需自行提供）；\n  answer      可选，回答文本；\n  note        可选，备注，最长 512；\n  user_id     用户标识，默认 anonymous，需与历史归属一致。\n\n预期响应 data：FavoriteItem —— {id, user_id, history_id, question, answer, note, citations[], credibility_score, created_at}。\n\n本请求脚本会把 data.id 写入集合变量 favoriteId，供「更新备注 / 删除收藏」复用。\n\n前置条件：{{historyId}} 由「提问」或「问答历史列表」填充；若为空，可先执行这两者之一。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "",
+                  "pm.test(\"业务码 code === 0\", function () {",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "});",
+                  "",
+                  "pm.test(\"返回收藏对象且问题文本非空\", function () {",
+                  "    pm.expect(body.data).to.be.an(\"object\");",
+                  "    pm.expect(body.data.question).to.be.a(\"string\");",
+                  "    pm.expect(body.data.question.length).to.be.above(0);",
+                  "});",
+                  "",
+                  "// 把收藏 id 写入集合变量，供更新备注 / 删除收藏复用",
+                  "if (body.data && body.data.id) {",
+                  "    pm.collectionVariables.set(\"favoriteId\", String(body.data.id));",
+                  "    console.log(\"已记录 favoriteId = \" + body.data.id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "收藏列表",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/favorites?user_id={{userId}}&limit=20&offset=0",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "favorites"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识"
+                },
+                {
+                  "key": "keyword",
+                  "value": "",
+                  "description": "可选：按问题/回答/备注搜索",
+                  "disabled": true
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "description": "每页条数 1~100"
+                },
+                {
+                  "key": "offset",
+                  "value": "0",
+                  "description": "偏移量"
+                }
+              ]
+            },
+            "description": "用途：分页查询当前用户的收藏。\n\n参数（query）：\n  user_id  用户标识，默认 anonymous，需与收藏时一致；\n  keyword  按问题/回答/备注模糊搜索，最长 100；\n  limit    每页条数 1~100，默认 20；\n  offset   偏移量。\n\n预期响应 data：{items:[FavoriteItem], meta:{total, limit, offset, has_more}}。\n\n本请求脚本会把第一条收藏的 id 写入 {{favoriteId}}，便于在未执行「新增收藏」时也能直接调试更新与删除。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回分页结构与收藏数组\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.items).to.be.an(\"array\");",
+                  "    pm.expect(body.data.meta).to.have.property(\"total\");",
+                  "});",
+                  "",
+                  "const items = (pm.response.json().data || {}).items || [];",
+                  "if (items.length > 0) {",
+                  "    pm.collectionVariables.set(\"favoriteId\", String(items[0].id));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "更新备注",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/favorites/{{favoriteId}}?user_id={{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "favorites",
+                "{{favoriteId}}"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，需与收藏归属一致"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"note\": \"已复核：第三条明确流动性风险指标按月报送，突发事件 24 小时内报告\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "用途：修改收藏的备注文字。\n\n参数：\n  favorite_id  路径参数，{{favoriteId}}；\n  user_id      查询参数，默认 anonymous，需与收藏归属一致；\n  note         请求体字段，新备注内容，最长 512，传空字符串表示清空备注。\n\n预期响应 data：更新后的完整 FavoriteItem。\n\n常见错误：404 表示该收藏不存在或不属于当前 user_id（后端不会跨用户泄露数据）。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"备注已更新\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.note).to.include(\"已复核\");",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "删除收藏",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/favorites/{{favoriteId}}?user_id={{userId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "favorites",
+                "{{favoriteId}}"
+              ],
+              "query": [
+                {
+                  "key": "user_id",
+                  "value": "{{userId}}",
+                  "description": "用户标识，需与收藏归属一致"
+                }
+              ]
+            },
+            "description": "用途：取消收藏（删除该条收藏记录）。\n\n参数：\n  favorite_id  路径参数，{{favoriteId}}；\n  user_id      查询参数，默认 anonymous，需与收藏归属一致。\n\n预期响应 data：{\"deleted\":true,\"favorite_id\":N}。\n\n说明：删除收藏不影响来源问答历史，两者互相独立。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 状态码为 200\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test(\"返回 deleted=true\", function () {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.code).to.eql(0);",
+                  "    pm.expect(body.data.deleted).to.be.true;",
+                  "});",
+                  "",
+                  "pm.collectionVariables.set(\"favoriteId\", \"\");"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

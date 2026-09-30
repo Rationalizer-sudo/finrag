@@ -1,0 +1,127 @@
+# =============================================================================
+#  FinRAG · docker-compose 开发覆盖示例（DEVELOPMENT OVERRIDE EXAMPLE）
+# =============================================================================
+#
+#  【中文说明】
+#  这是**开发环境专用**的覆盖文件示例，默认不生效。启用方式：
+#
+#      cp docker-compose.override.yml.example docker-compose.override.yml
+#      # Windows PowerShell: Copy-Item docker-compose.override.yml.example docker-compose.override.yml
+#
+#  Docker Compose 会**自动**读取项目根目录下同名的 docker-compose.override.yml
+#  并与 docker-compose.yml 合并（后者的值被覆盖文件覆盖），无需加 -f 参数。
+#  停用/恢复生产行为：删除或重命名该文件即可。
+#
+#  覆盖内容一览
+#  ---------------------------------------------------------------------------
+#    1) backend：改为 uvicorn --reload 热重载，并挂载源码目录，改代码即时生效；
+#    2) backend：APP_ENV=dev，打开 DEBUG 与更啰嗦的日志；
+#    3) CORS：放行 Vite 开发服务器（5173）与常见本地端口；
+#    4) MySQL：额外暴露 3306，便于用 Navicat / DBeaver 直连看数据；
+#    5) Milvus：额外暴露 19530/9091，便于用 Attu / pymilvus 本机直连调试；
+#    6) MinIO：暴露 9000/9001，可用浏览器打开控制台查看向量桶；
+#    7) 前端：默认不构建镜像，改由本机 `npm run dev` 跑 Vite（见文件末尾说明）。
+#
+#  【重要提醒】
+#  ---------------------------------------------------------------------------
+#    * 生产/答辩演示请勿使用本文件（挂载源码 + 关闭优化会带来安全与性能风险）；
+#    * 挂载源码后容器内的 app 包即宿主机目录，若宿主机与容器 Python 版本不一致
+#      （本项目镜像为 python:3.11），可能出现依赖不兼容，建议本机也用 3.11；
+#    * reload 模式下 uvicorn 会额外启动子进程监控文件变化，仅适合单人开发；
+#    * 修改 .env 后需 docker compose up -d 重建容器，环境变量不会热更新
+#      （源码改动才会被 --reload 捕获）；
+#    * 若宿主机 3306/19530 已被本地 MySQL/Milvus 占用，请把左侧端口改成
+#      13306 / 29530 之类的空闲端口。
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # 后端：热重载 + 源码挂载 + 调试模式
+  # ---------------------------------------------------------------------------
+  backend:
+    # 覆盖生产镜像里的 CMD；注意 --reload 与 --workers 不能同时使用
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/backend/app
+      - --log-level
+      - debug
+    environment:
+      # dev：配合 uvicorn --reload 与更详细的错误输出
+      APP_ENV: dev
+      APP_DEBUG: "true"
+      # 放行 Vite 开发服务器，避免前端 npm run dev 时出现跨域
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000,http://localhost
+      # 开发期打开 SQL 回显，便于排查 ORM 生成的语句（日志量较大）
+      MYSQL_ECHO: "false"
+      # 开发期想让容器内文件与宿主机完全一致可打开（镜像里默认是 1）
+      PYTHONDONTWRITEBYTECODE: "0"
+    volumes:
+      # 源码挂载：宿主机 backend/ -> 容器 /app/backend，保存即热重载
+      - ./backend:/app/backend
+      # 上传文件落到宿主机，方便直接查看解析结果
+      - ./var/uploads:/app/var/uploads
+      - ./data:/app/data
+      # 语料与运维脚本同步挂载，便于在容器内执行 CLI
+      - ./scripts:/app/scripts
+      - ./sql:/app/sql
+    ports:
+      # 与基础文件一致（8000:8000）。如需换宿主端口，改这里即可，
+      # 例如 "18000:8000"；再接入 debugpy 远程调试时可加 "5678:5678"。
+      - "8000:8000"
+    # 开发期保持与基础文件一致的顺序依赖（MySQL/Milvus 健康后再启动后端），
+    # 避免「接口调不通其实只是数据库还没起」这类误判。
+    # 注意：compose 合并规则中 depends_on 是「整体替换」而非追加，
+    # 因此这里必须用长格式把基础文件的 condition 完整写回来。
+    depends_on:
+      mysql:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # MySQL：暴露端口便于本地客户端直连
+  #   docker compose exec mysql mysql -u finrag -p finrag
+  # ---------------------------------------------------------------------------
+  mysql:
+    ports:
+      # 左侧宿主端口可改（如 13306），避免与本机已装的 MySQL 冲突
+      - "3306:3306"
+
+  # ---------------------------------------------------------------------------
+  # Milvus：暴露 gRPC 与指标端口，便于用 Attu / pymilvus 直连排查
+  #   本机验证：python -c "from pymilvus import connections; connections.connect(host='127.0.0.1', port='19530'); print('ok')"
+  # ---------------------------------------------------------------------------
+  milvus:
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+
+  # ---------------------------------------------------------------------------
+  # MinIO：暴露对象存储，可用浏览器打开 http://localhost:9001 查看向量桶
+  #   账号密码取自 .env 的 MINIO_ACCESS_KEY / MINIO_SECRET_KEY（默认 minioadmin/minioadmin）
+  # ---------------------------------------------------------------------------
+  minio:
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # ---------------------------------------------------------------------------
+  # 前端：开发期建议**不要**用容器里的 Nginx 托管 dist，
+  #       而是在宿主机 frontend/ 目录执行 `npm run dev`（Vite 自带 HMR）。
+  #       下面这段把容器的 80 端口改到 8080，避免与 Vite（5173）及生产环境
+  #       的 80 端口互相干扰；只做后端接口调试时可整段删除（frontend 仍会启动）。
+  #
+  #       另需在 frontend/vite.config.js 中配置开发代理，把 /api 转发到
+  #       http://127.0.0.1:8000，示例：
+  #         server: { port: 5173, proxy: { '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true } } }
+  # ---------------------------------------------------------------------------
+  frontend:
+    ports:
+      - "8080:80"

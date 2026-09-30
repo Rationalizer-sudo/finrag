@@ -1,0 +1,86 @@
+# ============================================================================
+#  FinRAG · Git 忽略规则
+# ============================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 测试与覆盖率产物 ----
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+var/coverage-html/
+var/coverage.xml
+.tox/
+.nox/
+
+# ---- 运行期产物 ----
+var/
+!var/.gitkeep
+*.log
+logs/
+
+# ---- 上传与临时文件 ----
+uploads/
+*.tmp
+*.bak
+
+# ---- 环境变量（含 API Key，绝不入库） ----
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ---- 前端 ----
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env.local
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 数据（体积大且可能含未公开材料，不入库） ----
+data/demo/
+data/uploads/
+*.pdf
+*.docx
+*.xlsx
+# 说明：语料目录只保留说明文件，制度原文由使用者从监管官网自行下载
+!data/corpus/README.md
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Docker 本地覆盖 ----
+docker-compose.override.yml
+
+# ---- 其他 ----
+*.orig
+*.rej

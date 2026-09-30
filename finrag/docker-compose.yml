@@ -1,0 +1,326 @@
+# =============================================================================
+#  FinRAG · 基于 RAG 的金融制度类知识问答系统 —— 一键编排
+# =============================================================================
+#
+#  文件位置与用法
+#  ---------------------------------------------------------------------------
+#    本文件位于【项目根目录】，必须在该目录执行命令（compose 会读取同目录 .env）：
+#      cd C:\Users\28212\Desktop\校企合作\finrag
+#      cp .env.example .env        # 首次使用必做，并填写 DASHSCOPE_API_KEY
+#      docker compose up -d --build
+#      docker compose ps
+#      docker compose logs -f backend
+#      docker compose down          # 停止（保留数据卷）
+#      docker compose down -v       # 停止并删除数据卷（清空 MySQL/Milvus 数据）
+#
+#  启动顺序（由 depends_on + healthcheck 自动保证，无需手工等待）
+#  ---------------------------------------------------------------------------
+#    1) mysql   ─┐
+#    2) etcd    ─┼─► milvus ─┐
+#    3) minio   ─┘           ├─► backend ─► frontend
+#    4) mysql   ─────────────┘
+#    详细：mysql 与 etcd/minio 并行启动；milvus 等 etcd+minio 健康后启动；
+#          backend 等 mysql+milvus 健康后启动；frontend 等 backend 健康后启动。
+#    首次启动 MySQL 会自动执行 sql/01_schema.sql 建表，故 backend 首次可能
+#    因建表尚未完成而报错重试，属正常现象（看 mysql 日志确认建表完成即可）。
+#
+#  资源建议（单机演示/答辩环境）
+#  ---------------------------------------------------------------------------
+#    CPU：≥ 4 核（Milvus standalone 约 1.5~2 核，MySQL 0.5 核，其余合计 1 核）
+#    内存：≥ 8 GB（Milvus ~2 GB，MySQL ~1 GB，backend ~1 GB，留 2 GB 余量）
+#    磁盘：≥ 20 GB（Milvus 向量 + etcd 元数据 + MySQL 数据 + 上传文件）
+#    镜像总大小：约 3~4 GB（backend 因含 Tesseract 语言包而偏大）
+#    如内存不足 8 GB，可给 backend 加 deploy.resources.limits.memory 并
+#    调小 MILVUS 的相关缓存参数；Milvus 是全栈中最吃内存的组件。
+#
+#  常见排障
+#  ---------------------------------------------------------------------------
+#    * backend 启动即退出，日志出现「MySQL 连接失败」
+#        -> docker compose logs mysql 确认初始化完成；确认 .env 中
+#           MYSQL_USER/MYSQL_PASSWORD/MYSQL_DB 三者已填写且非空。
+#    * backend 报「尚未创建数据表」
+#        -> 说明 01_schema.sql 未执行。首次初始化只挂载 sql/ 目录，
+#           若事后才补充 SQL 文件，需 docker compose down -v 后重新 up。
+#    * 上传文件报 Permission denied
+#        -> bind mount 的宿主机目录权限不足。宿主机执行：
+#           mkdir -p var/uploads data && chmod -R 777 var/uploads data（Linux/macOS）
+#           或在 Docker Desktop 中把项目目录加入 File Sharing。
+#    * 问答返回 502 / 未配置 DASHSCOPE_API_KEY
+#        -> .env 未填写有效 Key。改完 .env 后需 docker compose up -d 重建容器
+#           让新环境变量生效（环境变量不会热更新）。
+#    * Milvus 一直 unhealthy
+#        -> 多半是 etcd 或 minio 未就绪。先 docker compose logs etcd minio
+#           查看；确认 etcd_data/minio_data 卷未被旧版本数据污染（必要时 down -v）。
+#    * 端口被占用（3306 / 19530 / 8000 / 80）
+#        -> 修改本文件 ports 左侧的宿主机端口，例如 "13306:3306"。
+#    * OCR 不可用
+#        -> 容器内已装 tesseract-ocr + chi_sim，无需 TESSERACT_CMD。
+#           用 curl http://localhost:8000/api/v1/knowledge/ocr/status 自检。
+# =============================================================================
+
+name: finrag
+
+services:
+  # ===========================================================================
+  # MySQL 8：结构化数据（制度文档、条文、问答历史、收藏）
+  # ===========================================================================
+  mysql:
+    image: mysql:8.0
+    container_name: finrag-mysql
+    restart: unless-stopped
+    # 环境变量全部来自项目根目录的 .env（见 .env.example）
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DB:-finrag}
+      MYSQL_USER: ${MYSQL_USER:-finrag}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    # 字符集必须显式指定，否则中文条文会出现乱码 / emoji 存不进
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --explicit_defaults_for_timestamp=1
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动（数据卷为空）时，MySQL 会自动按文件名顺序执行该目录下的 .sql
+      - ./sql/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      # 用 mysqladmin ping 判定；如需更严格可改为 SELECT 1 查询
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - finrag-net
+
+  # ===========================================================================
+  # etcd：Milvus 的元数据 / 服务发现存储（Milvus 强依赖，不可省略）
+  # ===========================================================================
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: finrag-etcd
+    restart: unless-stopped
+    environment:
+      # ---- etcd 集群与存储配置（Milvus 官方 standalone 模板参数） ----
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+      - TZ=Asia/Shanghai
+    # 数据目录 /etcd 由命名卷持久化；advertise 地址用服务名，便于集群内解析
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test:
+        - CMD
+        - etcdctl
+        - --endpoints=http://127.0.0.1:2379
+        - endpoint
+        - health
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - finrag-net
+
+  # ===========================================================================
+  # MinIO：Milvus 的对象存储后端（保存向量索引文件与 binlog）
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: finrag-minio
+    restart: unless-stopped
+    environment:
+      # 注意：该版本 MinIO 使用 ACCESS_KEY / SECRET_KEY 变量名
+      # （新版本改为 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD，升级时需同步修改）
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      TZ: Asia/Shanghai
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - finrag-net
+    # 如需浏览器查看 MinIO 控制台，取消下面注释（默认仅集群内访问，不对外暴露）
+    # ports:
+    #   - "9001:9001"
+
+  # ===========================================================================
+  # Milvus v2.4 standalone：条文 embedding 向量库
+  # ===========================================================================
+  milvus:
+    image: milvusdb/milvus:v2.4.13
+    container_name: finrag-milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      # Milvus 官方要求：standalone 内部会操作线程/内存参数
+      - seccomp:unconfined
+    environment:
+      # ---- 依赖的 etcd 与 MinIO（用服务名，容器内 DNS 自动解析） ----
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_USE_SSL: "false"
+      MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME:-a-bucket}
+      COMMON_STORAGE_TYPE: minio
+      # ---- 部署模式 ----
+      DEPLOY_MODE: STANDALONE
+      # ---- 日志与数据目录 ----
+      LOG_LEVEL: info
+      DATA_COORD_DISK_SEGMENT_EXPIRATION: 400
+      # ---- 时区 ----
+      TZ: Asia/Shanghai
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"   # gRPC（pymilvus 连接端口）
+      - "9091:9091"     # 指标 / 健康检查端口
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    networks:
+      - finrag-net
+
+  # ===========================================================================
+  # backend：FastAPI 应用（RAG 问答 + 知识库管理）
+  # ===========================================================================
+  backend:
+    build:
+      # 上下文必须是项目根目录（Dockerfile 里要 COPY backend/ 与 requirements.txt）
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        # 依赖清单来源。默认用根目录 requirements.txt（当前仓库的权威清单）。
+        # 若将来以 backend/requirements.txt 为准，把这里改为 backend/requirements.txt。
+        REQUIREMENTS_FILE: requirements.txt
+    image: finrag-backend:latest
+    container_name: finrag-backend
+    restart: unless-stopped
+    env_file:
+      # 应用配置（数据库账号、通义千问 Key、切分参数等）统一走 .env，
+      # 与 docker compose 自身的变量替换共用同一个文件，避免两处维护。
+      - .env
+    environment:
+      # ---- 覆盖 .env 中「本机开发」的值：容器内必须用服务名而非 127.0.0.1 ----
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: ${MYSQL_DB:-finrag}
+      MYSQL_USER: ${MYSQL_USER:-finrag}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+      MYSQL_CHARSET: utf8mb4
+      MILVUS_HOST: milvus
+      MILVUS_PORT: "19530"
+      MILVUS_COLLECTION: ${MILVUS_COLLECTION:-finrag_clause}
+      # ---- 运行模式：prod 关闭 uvicorn reload（开发热重载见 override 示例） ----
+      APP_ENV: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      # ---- 前端经 Nginx 同源访问，同时保留 Vite 开发端口 ----
+      CORS_ORIGINS: http://localhost,http://127.0.0.1,http://localhost:5173,http://127.0.0.1:5173
+      # ---- 上传目录用绝对路径，与下方挂载点一致 ----
+      UPLOAD_DIR: /app/var/uploads
+      # ---- OCR：镜像内已装 tesseract 与 chi_sim，无需 TESSERACT_CMD ----
+      OCR_ENABLED: "true"
+      TESSERACT_LANG: chi_sim+eng
+      TZ: Asia/Shanghai
+    ports:
+      - "8000:8000"
+    volumes:
+      # 上传文件与语料（宿主机目录需可写，见文件顶部排障说明）
+      - ./var/uploads:/app/var/uploads
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - finrag-net
+
+  # ===========================================================================
+  # frontend：Vue3 构建产物由 Nginx 托管，并反向代理 /api 到 backend
+  # ===========================================================================
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        # 前端请求同源 /api/v1，由 Nginx 转发到 backend:8000（无跨域）
+        VITE_API_BASE_URL: /api/v1
+        # 静态资源基址。**.env.production 里默认是 /app/（后端静态挂载路径），
+        # 本编排由 Nginx 在根路径托管前端，故必须覆盖为 / ，否则页面白屏。**
+        VITE_PUBLIC_BASE: /
+    image: finrag-frontend:latest
+    container_name: finrag-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        # 等 backend 健康后再起前端：保证首个页面请求就能拿到接口数据。
+        # （Nginx 仍用 127.0.0.11 动态解析 backend，backend 重启后无需重启前端）
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - finrag-net
+
+# =============================================================================
+# 命名卷：数据持久化，`docker compose down` 不会删除，`down -v` 才会
+# =============================================================================
+volumes:
+  mysql_data:
+    driver: local
+  etcd_data:
+    driver: local
+  minio_data:
+    driver: local
+  milvus_data:
+    driver: local
+
+# =============================================================================
+# 自定义网络：容器间用服务名互访（mysql / milvus / backend ...）
+# =============================================================================
+networks:
+  finrag-net:
+    driver: bridge
